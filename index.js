@@ -3,91 +3,93 @@ import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import simpleGit from "simple-git";
 import { App } from "@octokit/app";
 
 dotenv.config();
 
-const app = express();
-app.use(bodyParser.json({ limit: "10mb" }));
+const server = express();
+server.use(bodyParser.json({ limit: "10mb" }));
 
-// Load private key
 const privateKey = fs.readFileSync(process.env.GITHUB_PRIVATE_KEY_PATH, "utf8");
 
-// Create GitHub App instance
 const githubApp = new App({
   appId: process.env.GITHUB_APP_ID,
   privateKey,
 });
 
-// 🔐 Verify webhook signature
+async function getInstallationOctokit(installationId) {
+  return githubApp.getInstallationOctokit(installationId);
+}
+
 function verifySignature(req) {
   const signature = req.headers["x-hub-signature-256"];
   if (!signature) return false;
 
   const hmac = crypto.createHmac("sha256", process.env.GITHUB_WEBHOOK_SECRET);
-
   const digest =
     "sha256=" + hmac.update(JSON.stringify(req.body)).digest("hex");
 
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
 }
 
-app.get("/", (req, res) => {
-  res.send("Hello from GitHub App!");
+server.get("/", (req, res) => {
+  res.send("Hello from Anoto Bot!");
 });
 
-// 🚀 Webhook endpoint
-app.post("/webhook", async (req, res) => {
+server.post("/webhook", async (req, res) => {
   try {
-    if (!verifySignature(req)) {
-      return res.status(401).send("Invalid signature");
-    }
-    console.log("EVENT:", req.headers["x-github-event"]);
+    if (!verifySignature(req)) return res.status(401).send("Invalid signature");
 
     const event = req.headers["x-github-event"];
     const payload = req.body;
-    console.log("event:", event);
-    console.log("PAYLOAD:", JSON.stringify(payload));
-    fs.writeFileSync(`payload-${Date.now()}.json`, JSON.stringify(payload, null, 2));
-    res.json(payload);
-    // if (event === "pull_request") {
-    //   const action = payload.action;
 
-    //   if (["opened", "synchronize", "reopened"].includes(action)) {
-    //     const prNumber = payload.pull_request.number;
-    //     const owner = payload.repository.owner.login;
-    //     const repo = payload.repository.name;
-    //     const installationId = payload.installation.id;
+    if (event !== "pull_request" || payload.action !== "opened") {
+      return res.send("ignored");
+    }
 
-    //     console.log(`📌 PR #${prNumber} ${action}`);
+    const installationId = payload.installation.id;
+    const octokit = await getInstallationOctokit(installationId);
 
-    //     // Authenticate as installation
-    //     const octokit = await githubApp.getInstallationOctokit(installationId);
+    const auth = await octokit.auth({ type: "installation" });
+    const token = auth.token;
+    const owner = payload.repository.owner.login;
+    const repo = payload.repository.name;
+    const branch = payload.pull_request.head.ref;
+    const cloneUrl = payload.pull_request.head.repo.clone_url;
 
-    //     // Fetch PR files
-    //     const files = await octokit.pulls.listFiles({
-    //       owner,
-    //       repo,
-    //       pull_number: prNumber,
-    //     });
+    const authedUrl = cloneUrl.replace(
+      "https://",
+      `https://x-access-token:${token}@`,
+    );
 
-    //     console.log("📝 Changed files:");
+    const dir = `./repo-${payload.pull_request.number}`;
 
-    //     files.data.forEach((file) => {
-    //       console.log("File:", file.filename);
-    //       console.log("Patch:", file.patch?.slice(0, 200));
-    //       console.log("-----");
-    //     });
-    //   }
-    // }
+    const git = simpleGit();
 
-    res.send("ok");
+    await git.clone(authedUrl, dir);
+
+    const repoGit = simpleGit({ baseDir: dir });
+
+    await repoGit.checkout(branch);
+    await repoGit.pull("origin", branch);
+
+    fs.appendFileSync(`${dir}/README.md`, "\n\nImproved by Anoto 🤖");
+
+    await repoGit.add(".");
+    await repoGit.commit("anoto: automated improvements", {
+      "--author": "anoto-bot <bot@anoto.dev>",
+    });
+
+    await repoGit.push("origin", branch);
+
+    res.send("success");
   } catch (err) {
     console.error(err);
     res.status(500).send("error");
   }
 });
 
-app.listen(process.env.PORT, () => {
+server.listen(process.env.PORT, () => {
   console.log(`🚀 Server running on port ${process.env.PORT}`);
 });
